@@ -624,7 +624,9 @@ var Drive = (function(){
     opts.headers = authHeaders(opts.headers);
     return fetch(url, opts).then(function(r){
       if(r.status===401){ throw {code:401}; }
-      if(!r.ok) throw {code:r.status};
+      if(!r.ok){
+        return r.text().then(function(t){ throw {code:r.status, message:t.slice(0,200)}; });
+      }
       return r.json();
     });
   }
@@ -670,7 +672,10 @@ var Drive = (function(){
       method:"PATCH",
       headers: authHeaders({"Content-Type":"application/json"}),
       body: content
-    }).then(function(r){ if(!r.ok) throw {code:r.status}; return r.json(); });
+    }).then(function(r){
+      if(!r.ok) return r.text().then(function(t){ throw {code:r.status, message:t.slice(0,200)}; });
+      return r.json();
+    });
   }
 
   function fetchProfile(){
@@ -757,6 +762,29 @@ var Drive = (function(){
     }
   }
 
+  function forceSync(cb){
+    if(!accessToken){ cb(false, "pas connecté"); return; }
+    setStatus("syncing");
+    var ensureFile = fileId ? Promise.resolve(fileId) : (function(){
+      var folderId;
+      return findFile(FOLDER_NAME, null, true)
+        .then(function(id){ return id || createFolder(FOLDER_NAME); })
+        .then(function(id){ folderId = id; return findFile(FILE_NAME, folderId, false); })
+        .then(function(id){ if(id){ fileId=id; return fileId; }
+          return createDataFile(folderId, JSON.stringify(DB)).then(function(newId){ fileId=newId; cacheToken(); return fileId; }); });
+    })();
+    ensureFile.then(function(id){
+      return uploadFile(id, JSON.stringify(DB));
+    }).then(function(){
+      setStatus("synced");
+      cb(true);
+    }).catch(function(err){
+      setStatus("error");
+      var detail = (err && err.code) ? ("code HTTP " + err.code) : (err && err.message) ? err.message : "erreur inconnue (voir la console)";
+      cb(false, detail);
+    });
+  }
+
   return {
     init: init,
     signIn: signIn,
@@ -765,6 +793,7 @@ var Drive = (function(){
     getStatus: function(){ return status; },
     getEmail: function(){ return email; },
     scheduleSync: scheduleSync,
+    forceSync: forceSync,
     isConnected: function(){ return !!accessToken; }
   };
 })();
@@ -1573,10 +1602,31 @@ function viewBackup(){
       txt.appendChild(el("div",null, Drive.getEmail() || "Connecté"));
       var sub = el("div","info__stat");
       sub.style.marginTop = "2px";
-      sub.textContent = Drive.getStatus()==="syncing" ? "Synchronisation en cours…" : "Dossier « Mirabilis » synchronisé automatiquement";
+      var st = Drive.getStatus();
+      var stTxt = {
+        syncing:"Synchronisation en cours…",
+        synced:"Dossier « Mirabilis » synchronisé — dernier envoi OK",
+        error:"⚠ Dernière synchro en échec — voir ci-dessous",
+        connecting:"Connexion en cours…"
+      }[st] || "En attente de la première synchro";
+      sub.textContent = stTxt;
+      sub.style.color = st==="error" ? "var(--danger)" : "";
       txt.appendChild(sub);
       row.appendChild(txt);
       accBox.appendChild(row);
+
+      var force = el("button","actionbtn","Synchroniser maintenant (test)");
+      force.onclick = function(){
+        force.textContent = "Synchronisation…";
+        Drive.forceSync(function(ok, detail){
+          force.textContent = "Synchroniser maintenant (test)";
+          paintAccount();
+          if(ok) alert("Synchro réussie. Vérifie le fichier mirabilis-data.json dans ton Drive.");
+          else alert("Échec de la synchro : " + detail);
+        });
+      };
+      accBox.appendChild(force);
+
       var out = el("button","actionbtn","Se déconnecter");
       out.onclick = function(){ Drive.signOut(); paintAccount(); };
       accBox.appendChild(out);
