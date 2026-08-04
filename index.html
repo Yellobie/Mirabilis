@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#141223">
 <title>Mirabilis</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -547,6 +549,91 @@ var Drive = (function(){
   var FOLDER_NAME = "Mirabilis";
   var FILE_NAME = "mirabilis-data.json";
   var TOKEN_KEY = "atelier.drive.token";
+  var SNAPSHOT_KEY = "atelier.drive.snapshot";
+
+  function deepEq(a,b){ return JSON.stringify(a) === JSON.stringify(b); }
+  function indexById(arr){ var m={}; (arr||[]).forEach(function(x){ m[x.id]=x; }); return m; }
+  function loadSnapshot(){
+    try{ var raw = localStorage.getItem(SNAPSHOT_KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
+  }
+  function saveSnapshot(db){
+    try{ localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(db)); }catch(e){}
+  }
+
+  /* fusion à 3 voies d'une liste de fiches (par id), avec repérage des vrais conflits */
+  function mergeItemArray(localArr, remoteArr, baselineArr, conflicts, ctx){
+    var lm=indexById(localArr), rm=indexById(remoteArr), bm=indexById(baselineArr||[]);
+    var ids={}; Object.keys(lm).forEach(function(k){ids[k]=1;}); Object.keys(rm).forEach(function(k){ids[k]=1;});
+    var out=[];
+    Object.keys(ids).forEach(function(id){
+      var L=lm[id], R=rm[id], B=bm[id];
+      if(L && R){
+        if(deepEq(L,R)){ out.push(L); return; }
+        if(B && deepEq(L,B)){ out.push(R); return; }
+        if(B && deepEq(R,B)){ out.push(L); return; }
+        var s1={__conflict:true,id:id}; out.push(s1);
+        conflicts.push({ctx:ctx,id:id,local:L,remote:R,type:"edit",slotArr:out});
+        return;
+      }
+      if(L && !R){
+        if(!B){ out.push(L); return; }
+        if(deepEq(L,B)){ return; }
+        var s2={__conflict:true,id:id}; out.push(s2);
+        conflicts.push({ctx:ctx,id:id,local:L,remote:null,type:"delete_remote",slotArr:out});
+        return;
+      }
+      if(R && !L){
+        if(!B){ out.push(R); return; }
+        if(deepEq(R,B)){ return; }
+        var s3={__conflict:true,id:id}; out.push(s3);
+        conflicts.push({ctx:ctx,id:id,local:null,remote:R,type:"delete_local",slotArr:out});
+        return;
+      }
+    });
+    return out;
+  }
+
+  function mergeProjects(localP, remoteP, baselineP, conflicts){
+    var lm=indexById(localP), rm=indexById(remoteP), bm=indexById(baselineP||[]);
+    var ids={}; Object.keys(lm).forEach(function(k){ids[k]=1;}); Object.keys(rm).forEach(function(k){ids[k]=1;});
+    var out=[];
+    Object.keys(ids).forEach(function(id){
+      var L=lm[id], R=rm[id], B=bm[id];
+      if(L && R){
+        var proj={id:id};
+        ["name","accent"].forEach(function(f){
+          if(L[f]===R[f]) proj[f]=L[f];
+          else if(B && L[f]===B[f]) proj[f]=R[f];
+          else if(B && R[f]===B[f]) proj[f]=L[f];
+          else proj[f]=L[f];
+        });
+        KINDS.forEach(function(k){
+          proj[k] = mergeItemArray(L[k]||[], R[k]||[], (B&&B[k])||[], conflicts, {projectId:id, projectName:proj.name, kind:k});
+        });
+        out.push(proj);
+        return;
+      }
+      if(L && !R){ if(!B || !deepEq(L,B)) out.push(L); return; }
+      if(R && !L){ if(!B || !deepEq(R,B)) out.push(R); return; }
+    });
+    return out;
+  }
+
+  function finalizeConflicts(conflicts){
+    conflicts.forEach(function(c){
+      var idx = c.slotArr.findIndex(function(x){ return x && x.__conflict && x.id===c.id; });
+      if(idx<0) return;
+      if(c.type==="edit"){
+        c.slotArr[idx] = c.resolution==="remote" ? c.remote : c.local;
+      }else if(c.type==="delete_remote"){
+        if(c.resolution==="delete") c.slotArr.splice(idx,1);
+        else c.slotArr[idx] = c.local;
+      }else if(c.type==="delete_local"){
+        if(c.resolution==="delete") c.slotArr.splice(idx,1);
+        else c.slotArr[idx] = c.remote;
+      }
+    });
+  }
 
   var tokenClient = null;
   var accessToken = null;
@@ -692,39 +779,61 @@ var Drive = (function(){
       .then(function(id){ return id || createFolder(FOLDER_NAME); })
       .then(function(id){ folderId = id; return findFile(FILE_NAME, folderId, false); })
       .then(function(id){
-        if(id){ fileId = id; cacheToken(); return pullRemote(); }
+        if(id){ fileId = id; cacheToken(); return syncFull(function(){ render(); }); }
         return createDataFile(folderId, JSON.stringify(DB)).then(function(newId){
-          fileId = newId; cacheToken(); setStatus("synced"); render();
+          fileId = newId; cacheToken(); saveSnapshot(DB); setStatus("synced"); render();
         });
       })
       .then(function(){ if(!email) fetchProfile().then(render); })
       .catch(function(err){ handleError(err); });
   }
 
-  function pullRemote(){
-    return downloadFile(fileId).then(function(text){
-      try{
-        var remote = JSON.parse(text);
-        if(remote && Array.isArray(remote.projects)){
-          remote.projects.forEach(function(p){
-            KINDS.forEach(function(k){ if(!Array.isArray(p[k])) p[k]=[]; });
-            if(!p.accent) p.accent = ACCENTS[0];
-          });
-          DB = remote;
+  function syncFull(cb){
+    if(!accessToken || !fileId){ cb && cb(false, "pas connecté"); return; }
+    setStatus("syncing");
+    downloadFile(fileId).then(function(text){
+      var remoteDB;
+      try{ remoteDB = JSON.parse(text); }catch(e){ remoteDB = null; }
+      if(!remoteDB || !Array.isArray(remoteDB.projects)) remoteDB = DB;
+
+      var baseline = loadSnapshot();
+      if(!baseline){
+        DB = remoteDB;
+        try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+        saveSnapshot(DB);
+        return uploadFile(fileId, JSON.stringify(DB));
+      }
+      if(deepEq(DB, remoteDB)){
+        saveSnapshot(DB);
+        return Promise.resolve();
+      }
+      var conflicts = [];
+      var mergedProjects = mergeProjects(DB.projects, remoteDB.projects, baseline.projects||[], conflicts);
+      var merged = { version:1, updatedAt:Date.now(), projects:mergedProjects };
+      if(!conflicts.length){
+        DB = merged;
+        try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
+        saveSnapshot(DB);
+        return uploadFile(fileId, JSON.stringify(DB));
+      }
+      return new Promise(function(resolve, reject){
+        showConflictSheet(conflicts, function(){
+          finalizeConflicts(conflicts);
+          DB = merged;
           try{ localStorage.setItem(STORE_KEY, JSON.stringify(DB)); }catch(e){}
-        }
-      }catch(e){}
+          saveSnapshot(DB);
+          uploadFile(fileId, JSON.stringify(DB)).then(resolve).catch(reject);
+        });
+      });
+    }).then(function(){
       setStatus("synced");
       render();
+      cb && cb(true);
+    }).catch(function(err){
+      var detail = (err && err.code) ? ("code HTTP " + err.code + (err.message?(" — "+err.message):"")) : (err && err.message) || "erreur inconnue";
+      handleError(err, true);
+      cb && cb(false, detail);
     });
-  }
-
-  function pushNow(){
-    if(!accessToken || !fileId){ return; }
-    setStatus("syncing");
-    uploadFile(fileId, JSON.stringify(DB))
-      .then(function(){ setStatus("synced"); })
-      .catch(function(err){ handleError(err, true); });
   }
 
   function scheduleSync(){
@@ -732,7 +841,7 @@ var Drive = (function(){
     pendingPush = true;
     clearTimeout(pushTimer);
     pushTimer = setTimeout(function(){
-      if(pendingPush){ pendingPush = false; pushNow(); }
+      if(pendingPush){ pendingPush = false; syncFull(); }
     }, 1500);
   }
 
@@ -752,10 +861,9 @@ var Drive = (function(){
     loadCachedToken();
     if(accessToken && tokenExpiry > Date.now()){
       setStatus("syncing");
-      if(fileId){ pullRemote().catch(handleError); }
+      if(fileId){ syncFull(); }
       else{ afterAuth(); }
     }else{
-      // token absent ou expiré : tente une reconnexion silencieuse si une session existait
       var hadSession = false;
       try{ hadSession = !!localStorage.getItem(TOKEN_KEY); }catch(e){}
       if(hadSession) setTimeout(function(){ signIn(false); }, 500);
@@ -764,25 +872,23 @@ var Drive = (function(){
 
   function forceSync(cb){
     if(!accessToken){ cb(false, "pas connecté"); return; }
+    if(fileId){ syncFull(cb); return; }
     setStatus("syncing");
-    var ensureFile = fileId ? Promise.resolve(fileId) : (function(){
-      var folderId;
-      return findFile(FOLDER_NAME, null, true)
-        .then(function(id){ return id || createFolder(FOLDER_NAME); })
-        .then(function(id){ folderId = id; return findFile(FILE_NAME, folderId, false); })
-        .then(function(id){ if(id){ fileId=id; return fileId; }
-          return createDataFile(folderId, JSON.stringify(DB)).then(function(newId){ fileId=newId; cacheToken(); return fileId; }); });
-    })();
-    ensureFile.then(function(id){
-      return uploadFile(id, JSON.stringify(DB));
-    }).then(function(){
-      setStatus("synced");
-      cb(true);
-    }).catch(function(err){
-      setStatus("error");
-      var detail = (err && err.code) ? ("code HTTP " + err.code) : (err && err.message) ? err.message : "erreur inconnue (voir la console)";
-      cb(false, detail);
-    });
+    var folderId;
+    findFile(FOLDER_NAME, null, true)
+      .then(function(id){ return id || createFolder(FOLDER_NAME); })
+      .then(function(id){ folderId = id; return findFile(FILE_NAME, folderId, false); })
+      .then(function(id){
+        if(id){ fileId=id; cacheToken(); syncFull(cb); return; }
+        return createDataFile(folderId, JSON.stringify(DB)).then(function(newId){
+          fileId=newId; cacheToken(); saveSnapshot(DB); setStatus("synced"); cb(true);
+        });
+      })
+      .catch(function(err){
+        setStatus("error");
+        var detail = (err && err.code) ? ("code HTTP " + err.code + (err.message?(" — "+err.message):"")) : "erreur inconnue";
+        cb(false, detail);
+      });
   }
 
   return {
@@ -909,6 +1015,44 @@ function sheet(title, buildBody, footBtn){
   function close(){ if(ov.parentNode) ov.parentNode.removeChild(ov); }
   buildBody(body, close);
   return close;
+}
+
+function conflictLabel(c){
+  var kind = c.ctx.kind;
+  var ref = c.local || c.remote;
+  var name = ref ? labelOf(kind, ref) : "Fiche supprimée";
+  return (c.ctx.projectName ? c.ctx.projectName + " · " : "") + SCHEMA[kind].singular + " « " + name + " »";
+}
+
+function showConflictSheet(conflicts, onDone){
+  sheet("Conflits à résoudre (" + conflicts.length + ")", function(body){
+    var intro = el("p", null, "Ces fiches ont été modifiées à la fois sur cet appareil et sur ton Drive depuis la dernière synchro. Choisis la version à garder pour chacune ; celles que tu ne touches pas garderont par défaut la version de cet appareil.");
+    intro.style.cssText = "color:var(--muted);font-size:13.5px;margin:0 0 16px";
+    body.appendChild(intro);
+
+    conflicts.forEach(function(c){
+      var box = el("div","info"); box.style.marginBottom = "12px";
+      box.appendChild(el("h3", null, conflictLabel(c)));
+      var seg = el("div","seg"); seg.style.marginTop = "10px";
+
+      var labelA, labelB, valA, valB;
+      if(c.type==="edit"){ labelA="Cet appareil"; labelB="Google Drive"; valA="local"; valB="remote"; }
+      else if(c.type==="delete_remote"){ labelA="Garder ma modification"; labelB="Confirmer la suppression"; valA="keep"; valB="delete"; }
+      else { labelA="Confirmer la suppression"; labelB="Garder la version du Drive"; valA="delete"; valB="keep"; }
+
+      c.resolution = valA; // choix par défaut, le moins destructeur
+      var bA = el("button","on", labelA);
+      var bB = el("button", null, labelB);
+      bA.onclick = function(){ c.resolution = valA; bA.className="on"; bB.className=""; };
+      bB.onclick = function(){ c.resolution = valB; bB.className="on"; bA.className=""; };
+      seg.appendChild(bA); seg.appendChild(bB);
+      box.appendChild(seg);
+      body.appendChild(box);
+    });
+  }, {
+    label:"Valider et synchroniser",
+    onClick: onDone
+  });
 }
 
 function pickerSheet(o){
@@ -1721,6 +1865,11 @@ document.getElementById("importfile").addEventListener("change", function(e){
 history.replaceState({d:1}, "");
 render();
 Drive.init();
+if("serviceWorker" in navigator){
+  window.addEventListener("load", function(){
+    navigator.serviceWorker.register("sw.js").catch(function(){ /* pas grave, l'app marche quand même en ligne */ });
+  });
+}
 window.addEventListener("resize", function(){
   var cv = document.querySelector(".sky canvas");
   if(cv) starfield(cv);
