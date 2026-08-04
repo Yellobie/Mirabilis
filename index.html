@@ -788,7 +788,7 @@ var Drive = (function(){
       .catch(function(err){ handleError(err); });
   }
 
-  function syncFull(cb){
+  function syncFull(cb, background){
     if(!accessToken || !fileId){ cb && cb(false, "pas connecté"); return; }
     setStatus("syncing");
     downloadFile(fileId).then(function(text){
@@ -827,7 +827,7 @@ var Drive = (function(){
       });
     }).then(function(){
       setStatus("synced");
-      render();
+      if(!background) render();
       cb && cb(true);
     }).catch(function(err){
       var detail = (err && err.code) ? ("code HTTP " + err.code + (err.message?(" — "+err.message):"")) : (err && err.message) || "erreur inconnue";
@@ -841,7 +841,7 @@ var Drive = (function(){
     pendingPush = true;
     clearTimeout(pushTimer);
     pushTimer = setTimeout(function(){
-      if(pendingPush){ pendingPush = false; syncFull(); }
+      if(pendingPush){ pendingPush = false; syncFull(null, true); }
     }, 1500);
   }
 
