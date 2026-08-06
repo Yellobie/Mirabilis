@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#141223">
-<title>Mirabilis</title>
+<title>Mira</title>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon.svg">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -472,7 +472,7 @@ SCHEMA.events.glyph = "◷";
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 
 function blankProject(name, accent){
-  return { id:uid(), name:name, accent:accent,
+  return { id:uid(), name:name, accent:accent, arcs:[],
            characters:[], locations:[], factions:[], events:[], notes:[] };
 }
 function seed(){
@@ -490,6 +490,7 @@ function load(){
     if(!d || !Array.isArray(d.projects)) return seed();
     d.projects.forEach(function(p){
       KINDS.forEach(function(k){ if(!Array.isArray(p[k])) p[k] = []; });
+      if(!Array.isArray(p.arcs)) p.arcs = [];
       if(!p.accent) p.accent = ACCENTS[0];
     });
     return d;
@@ -515,6 +516,28 @@ function save(quiet){
 function proj(pid){ for(var i=0;i<DB.projects.length;i++) if(DB.projects[i].id===pid) return DB.projects[i]; return null; }
 function item(pid,kind,id){ var p=proj(pid); if(!p) return null;
   for(var i=0;i<p[kind].length;i++) if(p[kind][i].id===id) return p[kind][i]; return null; }
+/* --- arcs --- */
+function sortedArcs(p){
+  return (p.arcs||[]).slice().sort(function(a,b){ return (a.order||0)-(b.order||0); });
+}
+function arcById(p, arcId){
+  for(var i=0;i<(p.arcs||[]).length;i++) if(p.arcs[i].id===arcId) return p.arcs[i];
+  return null;
+}
+/* arcId : "__all" = tout le projet, "" = éléments généraux, sinon un id d'arc */
+function inArc(o, arcId, includeGeneral){
+  if(arcId==="__all" || arcId===null || arcId===undefined) return true;
+  var a = o.arcs || [];
+  if(arcId==="") return a.length===0;
+  if(a.indexOf(arcId) >= 0) return true;
+  return !!includeGeneral && a.length===0;
+}
+function countInArc(p, kind, arcId, includeGeneral){
+  var n=0;
+  p[kind].forEach(function(o){ if(inArc(o, arcId, includeGeneral)) n++; });
+  return n;
+}
+
 function labelOf(kind,obj){
   if(!obj) return "—";
   if(kind==="notes"){ var s=(obj.content||"").trim().split("\n")[0]; return s ? (s.length>46?s.slice(0,46)+"…":s) : "Note sans texte"; }
@@ -550,6 +573,42 @@ var Drive = (function(){
   var FILE_NAME = "mirabilis-data.json";
   var TOKEN_KEY = "atelier.drive.token";
   var SNAPSHOT_KEY = "atelier.drive.snapshot";
+  var SESSION_KEY = "mira.session";
+  var OFFLINE_GRACE = 30 * 24 * 3600 * 1000;   // 30 jours d'accès hors ligne
+  var refreshTimer = null;
+
+  /* --- session locale : permet d'ouvrir l'app hors ligne sans écran Google --- */
+  function getSession(){
+    try{ var raw = localStorage.getItem(SESSION_KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
+  }
+  function setSession(mail){
+    try{ localStorage.setItem(SESSION_KEY, JSON.stringify({owner:mail, lastVerified:Date.now()})); }catch(e){}
+  }
+  function touchSession(){
+    var s = getSession();
+    if(s){ s.lastVerified = Date.now(); try{ localStorage.setItem(SESSION_KEY, JSON.stringify(s)); }catch(e){} }
+  }
+  function clearSession(){ try{ localStorage.removeItem(SESSION_KEY); }catch(e){} }
+  function sessionValid(){
+    var s = getSession();
+    return !!(s && s.owner && (Date.now() - (s.lastVerified||0) < OFFLINE_GRACE));
+  }
+  function owner(){ var s = getSession(); return s ? s.owner : null; }
+
+  /* --- renouvellement silencieux du jeton, avant expiration --- */
+  var refreshScheduled = null;
+  function scheduleRefresh(){
+    clearTimeout(refreshScheduled);
+    if(!tokenExpiry) return;
+    var delay = tokenExpiry - Date.now() - (5*60*1000);
+    if(delay < 5000) delay = 5000;
+    refreshScheduled = setTimeout(function(){ silentRefresh(); }, delay);
+  }
+  function silentRefresh(){
+    ensureClient();
+    if(!tokenClient) return;
+    try{ tokenClient.requestAccessToken({ prompt:"", hint: owner() || undefined }); }catch(e){}
+  }
 
   function deepEq(a,b){ return JSON.stringify(a) === JSON.stringify(b); }
   function indexById(arr){ var m={}; (arr||[]).forEach(function(x){ m[x.id]=x; }); return m; }
@@ -610,6 +669,8 @@ var Drive = (function(){
         KINDS.forEach(function(k){
           proj[k] = mergeItemArray(L[k]||[], R[k]||[], (B&&B[k])||[], conflicts, {projectId:id, projectName:proj.name, kind:k});
         });
+        proj.arcs = mergeItemArray(L.arcs||[], R.arcs||[], (B&&B.arcs)||[], conflicts, {projectId:id, projectName:proj.name, kind:"arcs"});
+        proj.arcs.sort(function(a,b){ return (a.order||0)-(b.order||0); });
         out.push(proj);
         return;
       }
@@ -678,11 +739,32 @@ var Drive = (function(){
           accessToken = resp.access_token;
           tokenExpiry = Date.now() + (Number(resp.expires_in||3300) * 1000);
           cacheToken();
-          afterAuth();
+          scheduleRefresh();
+          verifyOwnerThen(afterAuth);
         }else{
-          setStatus("error");
+          setStatus(sessionValid() ? "error" : "off");
+          render();
         }
       }
+    });
+  }
+
+  /* Vérifie que le compte connecté est bien celui qui possède les données de cet appareil. */
+  function verifyOwnerThen(next){
+    fetchProfile().then(function(){
+      var known = owner();
+      if(known && email && known.toLowerCase() !== email.toLowerCase()){
+        // mauvais compte : on refuse l'accès sans toucher aux données locales
+        accessToken = null; cacheToken();
+        setStatus("wrongaccount");
+        render();
+        return;
+      }
+      if(email) setSession(email); else touchSession();
+      next();
+    }).catch(function(){
+      touchSession();
+      next();
     });
   }
 
@@ -690,13 +772,25 @@ var Drive = (function(){
     ensureClient();
     if(!tokenClient){ setTimeout(function(){ signIn(interactive); }, 400); return; }
     setStatus("connecting");
-    tokenClient.requestAccessToken({ prompt: interactive ? "consent" : "" });
+    render();
+    var opts = { prompt: interactive ? "" : "" };
+    if(owner()) opts.hint = owner();
+    tokenClient.requestAccessToken(opts);
   }
 
-  function signOut(){
+  function signOut(wipeLocal){
+    clearTimeout(refreshScheduled);
     if(accessToken){ try{ google.accounts.oauth2.revoke(accessToken, function(){}); }catch(e){} }
     clearToken();
+    clearSession();
+    if(wipeLocal){
+      try{ localStorage.removeItem(STORE_KEY); }catch(e){}
+      try{ localStorage.removeItem(SNAPSHOT_KEY); }catch(e){}
+      DB = seed();
+    }
     setStatus("off");
+    nav = [{v:"home"}];
+    try{ history.replaceState({d:1},""); }catch(e){}
     render();
   }
 
@@ -860,13 +954,19 @@ var Drive = (function(){
   function init(){
     loadCachedToken();
     if(accessToken && tokenExpiry > Date.now()){
+      touchSession();
+      scheduleRefresh();
       setStatus("syncing");
       if(fileId){ syncFull(); }
       else{ afterAuth(); }
+      return;
+    }
+    if(sessionValid()){
+      // session locale encore valable : on ouvre l'app tout de suite (utile hors ligne)
+      setStatus("off");
+      setTimeout(function(){ if(navigator.onLine) silentRefresh(); }, 400);
     }else{
-      var hadSession = false;
-      try{ hadSession = !!localStorage.getItem(TOKEN_KEY); }catch(e){}
-      if(hadSession) setTimeout(function(){ signIn(false); }, 500);
+      setStatus("off");
     }
   }
 
@@ -891,16 +991,24 @@ var Drive = (function(){
       });
   }
 
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState==="visible" && sessionValid() && navigator.onLine){
+      if(!accessToken || tokenExpiry - Date.now() < 5*60*1000) silentRefresh();
+    }
+  });
+
   return {
     init: init,
     signIn: signIn,
     signOut: signOut,
     onStatus: onStatus,
     getStatus: function(){ return status; },
-    getEmail: function(){ return email; },
+    getEmail: function(){ return email || owner(); },
     scheduleSync: scheduleSync,
     forceSync: forceSync,
-    isConnected: function(){ return !!accessToken; }
+    isConnected: function(){ return !!accessToken; },
+    isUnlocked: sessionValid,
+    getOwner: owner
   };
 })();
 
@@ -1020,6 +1128,9 @@ function sheet(title, buildBody, footBtn){
 function conflictLabel(c){
   var kind = c.ctx.kind;
   var ref = c.local || c.remote;
+  if(kind==="arcs"){
+    return (c.ctx.projectName ? c.ctx.projectName + " · " : "") + "Arc « " + ((ref && ref.name) || "sans nom") + " »";
+  }
   var name = ref ? labelOf(kind, ref) : "Fiche supprimée";
   return (c.ctx.projectName ? c.ctx.projectName + " · " : "") + SCHEMA[kind].singular + " « " + name + " »";
 }
@@ -1121,13 +1232,65 @@ function paintSyncPill(pill){
 }
 Drive.onStatus(function(){ paintSyncPill(); });
 
+function viewGate(){
+  var wrapOuter = el("div");
+  wrapOuter.style.cssText = "min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px";
+  var box = el("div");
+  box.style.cssText = "max-width:400px;width:100%;text-align:center";
+
+  var mark = el("div");
+  mark.style.cssText = "width:74px;height:74px;margin:0 auto 22px;border-radius:20px;background:var(--surface);"+
+    "border:1px solid var(--line);display:flex;align-items:center;justify-content:center;"+
+    "font-family:Georgia,serif;font-size:38px;color:var(--accent)";
+  mark.textContent = "M";
+  box.appendChild(mark);
+
+  var t = el("h1","serif");
+  t.style.cssText = "font-size:32px;font-weight:300;margin:0 0 10px";
+  t.textContent = "Mira";
+  box.appendChild(t);
+
+  var st = Drive.getStatus();
+  var sub = el("p");
+  sub.style.cssText = "color:var(--muted);font-size:14.5px;line-height:1.6;margin:0 0 28px";
+
+  if(st==="wrongaccount"){
+    sub.style.color = "var(--danger)";
+    sub.textContent = "Ce compte Google n'est pas celui associé aux données de cet appareil. Connecte-toi avec " + (Drive.getOwner()||"le bon compte") + ".";
+  }else if(st==="connecting"){
+    sub.textContent = "Connexion en cours…";
+  }else{
+    sub.textContent = "Connecte-toi pour accéder à tes mondes.";
+  }
+  box.appendChild(sub);
+
+  if(st!=="connecting"){
+    var g = el("button","gbtn");
+    g.innerHTML = '<svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.7-1.57 2.68-3.88 2.68-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.81.54-1.85.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33A9 9 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.97 10.71A5.4 5.4 0 0 1 3.68 9c0-.59.1-1.17.29-1.71V4.96H.96A9 9 0 0 0 0 9c0 1.45.35 2.83.96 4.04l3.01-2.33z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.96l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>' +
+      '<span>Se connecter avec Google</span>';
+    g.onclick = function(){ Drive.signIn(true); };
+    box.appendChild(g);
+  }
+
+  var note = el("p");
+  note.style.cssText = "color:var(--muted-2);font-size:11.5px;line-height:1.6;margin:26px 0 0";
+  note.textContent = "Tes données restent dans ton Drive personnel et dans ce navigateur. Une fois connecté, l'app reste accessible hors ligne pendant 30 jours.";
+  box.appendChild(note);
+
+  wrapOuter.appendChild(box);
+  app.appendChild(wrapOuter);
+}
+
 function render(){
   var s = nav[nav.length-1];
   app.innerHTML = "";
   window.scrollTo(0,0);
+  if(!Drive.isUnlocked()) return viewGate();
   if(s.v==="home")       return viewHome();
   if(s.v==="project")    return viewProject(s.pid);
-  if(s.v==="list")       return viewList(s.pid, s.kind);
+  if(s.v==="arc")        return viewArc(s.pid, s.arcId);
+  if(s.v==="arcsmanage") return viewArcsManage(s.pid);
+  if(s.v==="list")       return viewList(s.pid, s.kind, s.arcId);
   if(s.v==="item")       return viewItem(s.pid, s.kind, s.id);
   if(s.v==="pickproj")   return viewPickProject();
   if(s.v==="backup")     return viewBackup();
@@ -1152,8 +1315,11 @@ function viewHome(){
   var sky = el("div","sky");
   var cv = document.createElement("canvas"); sky.appendChild(cv);
   var inner = el("div","sky__inner");
-  inner.appendChild(el("div","sky__eyebrow","Mirabilis"));
-  var h = el("h1","sky__title serif"); h.textContent = "Trois mondes en cours";
+  inner.appendChild(el("div","sky__eyebrow","Mira"));
+  var h = el("h1","sky__title serif");
+  var nb = DB.projects.length;
+  var mots = ["Aucun monde","Un monde","Deux mondes","Trois mondes","Quatre mondes","Cinq mondes"];
+  h.textContent = (mots[nb] || (nb + " mondes")) + (nb>1 ? " en cours" : " en cours");
   inner.appendChild(h);
   inner.appendChild(el("p","sky__sub","Toutes tes notes tiennent ici, hors de Messenger."));
   sky.appendChild(inner);
@@ -1249,6 +1415,88 @@ function viewProject(pid){
   app.appendChild(topbar(p.name, {action:"⛭", onAction:function(){ go({v:"projedit", pid:pid}); }}));
   var w = el("div","wrap");
   w.style.setProperty("--pj", p.accent);
+
+  var arcs = sortedArcs(p);
+
+  if(arcs.length){
+    w.appendChild(el("div","sectionlabel","Arcs narratifs"));
+
+    var gen = el("button","menurow");
+    gen.style.setProperty("--pj", p.accent);
+    gen.appendChild(el("div","menurow__glyph","◇"));
+    var gt = el("div");
+    gt.appendChild(el("div","menurow__name","Général"));
+    var nGen = KINDS.reduce(function(a,k){ return a + countInArc(p,k,"",false); },0);
+    gt.appendChild(el("div","menurow__meta", nGen ? nGen + " élément" + (nGen>1?"s":"") + " transverses" : "Éléments présents dans tous les arcs"));
+    gen.appendChild(gt);
+    gen.appendChild(el("div","menurow__chev","›"));
+    gen.onclick = function(){ go({v:"arc", pid:pid, arcId:""}); };
+    w.appendChild(gen);
+
+    arcs.forEach(function(a, i){
+      var b = el("button","menurow");
+      b.style.setProperty("--pj", p.accent);
+      b.appendChild(el("div","menurow__glyph", String(i+1)));
+      var t = el("div");
+      t.appendChild(el("div","menurow__name", a.name || ("Arc " + (i+1))));
+      var n = KINDS.reduce(function(acc,k){ return acc + countInArc(p,k,a.id,false); },0);
+      t.appendChild(el("div","menurow__meta", n ? n + " élément" + (n>1?"s":"") : "Vide"));
+      b.appendChild(t);
+      b.appendChild(el("div","menurow__chev","›"));
+      b.onclick = function(){ go({v:"arc", pid:pid, arcId:a.id}); };
+      w.appendChild(b);
+    });
+
+    var all = el("button","ghostbtn","Voir tout le projet, arcs confondus");
+    all.style.marginTop = "4px";
+    all.onclick = function(){ go({v:"arc", pid:pid, arcId:"__all"}); };
+    w.appendChild(all);
+
+    var manage = el("button","ghostbtn","Gérer les arcs");
+    manage.style.marginTop = "10px";
+    manage.onclick = function(){ go({v:"arcsmanage", pid:pid}); };
+    w.appendChild(manage);
+
+  }else{
+    w.appendChild(el("div","sectionlabel","Sections"));
+    KINDS.forEach(function(k){
+      var b = el("button","menurow");
+      b.style.setProperty("--pj", p.accent);
+      b.appendChild(el("div","menurow__glyph", SCHEMA[k].glyph));
+      var t = el("div");
+      t.appendChild(el("div","menurow__name", SCHEMA[k].plural));
+      t.appendChild(el("div","menurow__meta", p[k].length ? p[k].length + " fiche" + (p[k].length>1?"s":"") : "Vide"));
+      b.appendChild(t);
+      b.appendChild(el("div","menurow__chev","›"));
+      b.onclick = function(){ go({v:"list", pid:pid, kind:k, arcId:"__all"}); };
+      w.appendChild(b);
+    });
+    var org = el("button","ghostbtn","+  Organiser ce projet en arcs");
+    org.style.marginTop = "6px";
+    org.onclick = function(){ go({v:"arcsmanage", pid:pid}); };
+    w.appendChild(org);
+  }
+
+  app.appendChild(w);
+}
+
+/* écran d'un arc : les 5 sections filtrées */
+function viewArc(pid, arcId){
+  var p = proj(pid);
+  if(!p) return back();
+  var a = arcId && arcId!=="__all" ? arcById(p, arcId) : null;
+  var title = arcId==="__all" ? "Tout le projet" : (arcId==="" ? "Général" : (a ? (a.name || "Arc") : "Arc"));
+  app.appendChild(topbar(title));
+  var w = el("div","wrap");
+  w.style.setProperty("--pj", p.accent);
+
+  if(arcId==="" ){
+    var note = el("p");
+    note.style.cssText = "color:var(--muted);font-size:13px;margin:0 0 18px;line-height:1.6";
+    note.textContent = "Les fiches qui ne sont rattachées à aucun arc en particulier — personnages récurrents, lieux permanents, règles du monde.";
+    w.appendChild(note);
+  }
+
   w.appendChild(el("div","sectionlabel","Sections"));
   KINDS.forEach(function(k){
     var b = el("button","menurow");
@@ -1256,13 +1504,105 @@ function viewProject(pid){
     b.appendChild(el("div","menurow__glyph", SCHEMA[k].glyph));
     var t = el("div");
     t.appendChild(el("div","menurow__name", SCHEMA[k].plural));
-    t.appendChild(el("div","menurow__meta", p[k].length ? p[k].length + " fiche" + (p[k].length>1?"s":"") : "Vide"));
+    var n = countInArc(p, k, arcId, false);
+    t.appendChild(el("div","menurow__meta", n ? n + " fiche" + (n>1?"s":"") : "Vide"));
     b.appendChild(t);
     b.appendChild(el("div","menurow__chev","›"));
-    b.onclick = function(){ go({v:"list", pid:pid, kind:k}); };
+    b.onclick = function(){ go({v:"list", pid:pid, kind:k, arcId:arcId}); };
     w.appendChild(b);
   });
   app.appendChild(w);
+}
+
+/* gestion des arcs : créer, renommer, réordonner, supprimer */
+function viewArcsManage(pid){
+  var p = proj(pid);
+  if(!p) return back();
+  app.appendChild(topbar("Gérer les arcs"));
+  var w = el("div","wrap");
+  w.style.setProperty("--pj", p.accent);
+  app.appendChild(w);
+
+  var host = el("div"); w.appendChild(host);
+
+  function normalize(){
+    sortedArcs(p).forEach(function(a,i){ a.order = i; });
+  }
+
+  function draw(){
+    host.innerHTML = "";
+    var arcs = sortedArcs(p);
+    if(!arcs.length){
+      var e = el("div","empty");
+      e.appendChild(el("div","empty__title","Aucun arc"));
+      e.appendChild(el("div","empty__text","Découpe ton récit en arcs pour ranger chaque personnage, lieu ou événement là où il intervient. Les fiches transverses restent dans « Général »."));
+      host.appendChild(e);
+    }
+    arcs.forEach(function(a, i){
+      var row = el("div","info"); row.style.marginBottom = "10px";
+      var top = el("div"); top.style.cssText = "display:flex;gap:8px;align-items:center";
+      var num = el("div","menurow__glyph", String(i+1));
+      num.style.setProperty("--pj", p.accent);
+      top.appendChild(num);
+      var inp = document.createElement("input");
+      inp.type = "text"; inp.value = a.name || "";
+      inp.placeholder = "Nom de l'arc";
+      inp.style.cssText = "flex:1;min-width:0;background:var(--ink-2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;outline:none;font-size:15px";
+      inp.oninput = function(){ a.name = inp.value; save(); };
+      top.appendChild(inp);
+      row.appendChild(top);
+
+      var acts = el("div"); acts.style.cssText = "display:flex;gap:8px;margin-top:10px";
+      function mini(label, fn, danger){
+        var b = el("button", null, label);
+        b.style.cssText = "flex:1;padding:9px;border-radius:9px;border:1px solid " +
+          (danger ? "rgba(228,118,124,.35)" : "var(--line)") + ";font-size:13px;color:" +
+          (danger ? "var(--danger)" : "var(--muted)") + ";background:transparent";
+        b.onclick = fn;
+        return b;
+      }
+      acts.appendChild(mini("↑", function(){
+        if(i===0) return;
+        var prev = arcs[i-1];
+        var tmp = a.order; a.order = prev.order; prev.order = tmp;
+        normalize(); save(); draw();
+      }));
+      acts.appendChild(mini("↓", function(){
+        if(i===arcs.length-1) return;
+        var next = arcs[i+1];
+        var tmp = a.order; a.order = next.order; next.order = tmp;
+        normalize(); save(); draw();
+      }));
+      var used = KINDS.reduce(function(acc,k){ return acc + countInArc(p,k,a.id,false); },0);
+      acts.appendChild(mini("Supprimer", function(){
+        var msg = used
+          ? "Supprimer cet arc ? Les " + used + " fiche(s) qui y sont rattachées ne seront pas supprimées : elles basculeront dans « Général »."
+          : "Supprimer cet arc ?";
+        if(!confirm(msg)) return;
+        p.arcs = p.arcs.filter(function(x){ return x.id!==a.id; });
+        KINDS.forEach(function(k){
+          p[k].forEach(function(o){
+            if(Array.isArray(o.arcs)) o.arcs = o.arcs.filter(function(v){ return v!==a.id; });
+          });
+        });
+        normalize(); save(); draw();
+      }, true));
+      row.appendChild(acts);
+      host.appendChild(row);
+    });
+
+    var add = el("button","ghostbtn","+  Ajouter un arc");
+    add.style.marginTop = "6px";
+    add.onclick = function(){
+      var n = prompt("Nom de l'arc (ex. « L'Ordre de l'Éclipse »)");
+      if(n===null) return;
+      p.arcs = p.arcs || [];
+      p.arcs.push({ id:uid(), name:(n||"").trim() || ("Arc " + (p.arcs.length+1)), order:p.arcs.length });
+      normalize(); save(); draw();
+    };
+    host.appendChild(add);
+  }
+  draw();
 }
 
 /* ---- réglages projet ---- */
@@ -1307,7 +1647,7 @@ function viewProjectSettings(pid){
 }
 
 /* ---- liste ---- */
-function newItem(pid, kind){
+function newItem(pid, kind, arcId){
   var o = {id:uid(), createdAt:Date.now()};
   SCHEMA[kind].fields.forEach(function(f){
     if(f.g) return;
@@ -1315,6 +1655,7 @@ function newItem(pid, kind){
     else if(f.t==="status") o[f.k] = "todo";
     else o[f.k] = "";
   });
+  o.arcs = (arcId && arcId!=="__all" && arcId!=="") ? [arcId] : [];
   proj(pid)[kind].unshift(o);
   save(true);
   return o;
@@ -1337,22 +1678,42 @@ function sortItems(kind, arr){
   return a;
 }
 
-function viewList(pid, kind){
+function viewList(pid, kind, arcId){
   var p = proj(pid);
   if(!p) return back();
+  if(arcId===undefined) arcId = "__all";
   var S = SCHEMA[kind];
-  app.appendChild(topbar(S.plural));
+  var arcObj = (arcId && arcId!=="__all" && arcId!=="") ? arcById(p, arcId) : null;
+  var titre = S.plural;
+  if(arcObj) titre = S.plural + " · " + (arcObj.name || "Arc");
+  else if(arcId==="") titre = S.plural + " · Général";
+  app.appendChild(topbar(titre));
   var w = el("div","wrap");
   w.style.setProperty("--pj", p.accent);
   app.appendChild(w);
 
-  var query = "", tagFilter = "";
+  var query = "", tagFilter = "", withGeneral = false;
 
   var s = el("div","search");
   s.appendChild(el("span","search__icon","⌕"));
   var inp = document.createElement("input");
   inp.type="text"; inp.placeholder = "Rechercher dans les " + S.plural.toLowerCase();
   s.appendChild(inp); w.appendChild(s);
+
+  /* dans un arc précis, option pour voir aussi les fiches transverses */
+  if(arcObj){
+    var togg = el("button", null, "+ Afficher aussi les éléments généraux");
+    togg.style.cssText = "width:100%;padding:10px;border:1px dashed var(--line);border-radius:11px;"+
+      "color:var(--muted);font-size:13px;margin-bottom:14px;background:transparent";
+    togg.onclick = function(){
+      withGeneral = !withGeneral;
+      togg.textContent = withGeneral ? "− Masquer les éléments généraux" : "+ Afficher aussi les éléments généraux";
+      togg.style.color = withGeneral ? p.accent : "var(--muted)";
+      togg.style.borderColor = withGeneral ? p.accent : "var(--line)";
+      draw();
+    };
+    w.appendChild(togg);
+  }
 
   var tagRow = null;
   if(kind==="notes"){
@@ -1383,6 +1744,7 @@ function viewList(pid, kind){
   var listBox = el("div"); w.appendChild(listBox);
 
   function matches(o){
+    if(!inArc(o, arcId, withGeneral)) return false;
     if(tagFilter && (o.tags||[]).indexOf(tagFilter)<0) return false;
     if(!query) return true;
     var q = query.toLowerCase(), hit = false;
@@ -1472,7 +1834,7 @@ function viewList(pid, kind){
   fab.style.setProperty("--pj", p.accent);
   fab.textContent = "+  " + (kind==="notes" ? "Note" : S.singular);
   fab.onclick = function(){
-    var o = newItem(pid, kind);
+    var o = newItem(pid, kind, arcId);
     go({v:"item", pid:pid, kind:kind, id:o.id, isNew:true});
   };
   app.appendChild(fab);
@@ -1495,6 +1857,37 @@ function viewItem(pid, kind, id){
 
   var titleEl = app.querySelector(".topbar__title");
   function touch(){ save(); titleEl.textContent = labelOf(kind,o); }
+
+  /* rattachement aux arcs, si le projet en possède */
+  var arcs = sortedArcs(p);
+  if(arcs.length){
+    var abox = el("div","field");
+    abox.appendChild(el("label","field__label","Arcs"));
+    var achips = el("div","chips");
+    abox.appendChild(achips);
+    var ahint = el("div","field__hint");
+    abox.appendChild(ahint);
+    function drawArcs(){
+      achips.innerHTML = "";
+      o.arcs = o.arcs || [];
+      arcs.forEach(function(a){
+        var on = o.arcs.indexOf(a.id) >= 0;
+        var c = el("button","chip" + (on ? "" : " chip--add"), a.name || "Arc");
+        if(on){ c.style.borderColor = p.accent; c.style.color = p.accent; }
+        c.onclick = function(){
+          var i = o.arcs.indexOf(a.id);
+          if(i>=0) o.arcs.splice(i,1); else o.arcs.push(a.id);
+          touch(); drawArcs();
+        };
+        achips.appendChild(c);
+      });
+      ahint.textContent = (o.arcs.length===0)
+        ? "Aucun arc : cette fiche apparaît dans « Général »."
+        : "Apparaît dans " + o.arcs.length + " arc" + (o.arcs.length>1?"s":"") + ".";
+    }
+    drawArcs();
+    w.appendChild(abox);
+  }
 
   var cur = null;
   S.fields.forEach(function(f){
@@ -1772,7 +2165,10 @@ function viewBackup(){
       accBox.appendChild(force);
 
       var out = el("button","actionbtn","Se déconnecter");
-      out.onclick = function(){ Drive.signOut(); paintAccount(); };
+      out.onclick = function(){
+        var wipe = confirm("Se déconnecter.\n\nEffacer aussi les données stockées sur cet appareil ?\n\nOK = effacer (elles restent dans ton Drive)\nAnnuler = les garder pour le mode hors ligne");
+        Drive.signOut(wipe);
+      };
       accBox.appendChild(out);
     }else{
       accBox.appendChild(el("h3",null,"Google Drive"));
@@ -1844,6 +2240,7 @@ document.getElementById("importfile").addEventListener("change", function(e){
       if(!confirm("Remplacer tout le contenu actuel par ce fichier ?")) return;
       d.projects.forEach(function(p){
         KINDS.forEach(function(k){ if(!Array.isArray(p[k])) p[k] = []; });
+        if(!Array.isArray(p.arcs)) p.arcs = [];
         if(!p.accent) p.accent = ACCENTS[0];
         if(!p.id) p.id = uid();
       });

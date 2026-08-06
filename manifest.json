@@ -1,6 +1,6 @@
 {
-  "name": "Mirabilis",
-  "short_name": "Mirabilis",
+  "name": "Mira",
+  "short_name": "Mira",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

@@ -1,8 +1,8 @@
-// Service worker de Mirabilis : permet à l'app de s'ouvrir sans connexion.
+// Service worker de Mira : permet à l'app de s'ouvrir sans connexion.
 // Les données elles-mêmes restent gérées par localStorage + Google Drive,
 // ce fichier ne fait que mettre en cache le "coffrage" de l'application.
 
-var CACHE = "mirabilis-shell-v1";
+var CACHE = "mira-shell-v2";
 var SHELL = ["./", "./index.html", "./manifest.json", "./icon.svg"];
 
 self.addEventListener("install", function(e){
